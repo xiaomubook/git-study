@@ -1,0 +1,124 @@
+using Cysharp.Threading;
+using Cysharp.Threading.Tasks;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEngine;
+using ZXing.Aztec.Internal;
+
+public class TaskManager : MonoBehaviour
+{
+    private const int MAX_CONCURRENT = 3;
+
+    public static TaskManager Instance { get; private set; }
+
+    private int _currentRunning;
+    private readonly object _locker = new object();
+    public CancellationTokenSource _cts = new CancellationTokenSource();
+
+    private bool isRunning = true;
+
+    private void Awake()
+    {
+        if (Instance != null)
+        {
+            if (Instance != this) Destroy(this);
+            return;
+        }
+        Instance = this;
+        DontDestroyOnLoad(gameObject);
+        //ConsumeTasks(_cts.Token).Forget();
+    }
+
+    private void OnDestroy()
+    {
+        StopAll();
+    }
+
+    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(3, 3);
+    private ConcurrentQueue<TaskInfo> _taskQueue = new ConcurrentQueue<TaskInfo>();
+
+    /// <summary>
+    /// </summary>
+    public async UniTaskVoid ConsumeTasks()
+    {
+        _cts = new CancellationTokenSource();
+        isRunning = true;
+        _taskQueue = new ConcurrentQueue<TaskInfo>();
+        while (isRunning)
+        {
+            await _semaphore.WaitAsync(_cts.Token);
+            try
+            {
+                if (_taskQueue.TryDequeue(out var taskInfo))
+                {
+                    try
+                    {
+                        await taskInfo.TaskFunc(_cts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Debug.LogWarning($"Task [{taskInfo.Description}] Cancel！");
+                    }
+                    catch (IndexOutOfRangeException ex)
+                    {
+                        Debug.LogError($"Task [{taskInfo.Description}] Index error：{ex.Message}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError($"Task [{taskInfo.Description}] excuete error：{ex.Message}");
+                    }
+                }
+                else
+                {
+                    await UniTask.Delay(100, cancellationToken: _cts.Token);
+                }
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+
+        }
+    }
+
+    /// <summary>
+    /// </summary>
+    public void StopAll()
+    {
+        _cts.Cancel();
+        _cts.Dispose();
+        _cts = new CancellationTokenSource();
+        isRunning = false;
+        lock (_locker)
+        {
+            _currentRunning = 0;
+            while (_taskQueue.TryDequeue(out _)) { }
+            _taskQueue = new ConcurrentQueue<TaskInfo>();
+        }
+    }
+
+    /// <summary>
+    /// </summary>
+    public void AddTask(string description, Func<CancellationToken, UniTask> task)
+    {
+        if (task == null) throw new ArgumentNullException(nameof(task));
+
+        var taskInfo = new TaskInfo
+        {
+            Description = description,
+            TaskFunc = task
+        };
+
+        _taskQueue.Enqueue(taskInfo);
+        Debug.Log($"Task [{description}] Added！current count：{_taskQueue.Count}");
+    }
+
+    private class TaskInfo
+    {
+        public string Description { get; set; }
+        public Func<CancellationToken, UniTask> TaskFunc { get; set; }
+    }
+}
