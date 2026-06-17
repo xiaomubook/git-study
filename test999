@@ -1,0 +1,198 @@
+using UnityEngine;
+using Unity.InferenceEngine;
+using System.Collections.Generic;
+
+public class ModelExecutionMultipleInputsOutputs : MonoBehaviour
+{
+    [SerializeField]
+    ModelAsset modelAsset;
+    Worker m_Worker;
+    Tensor[] m_Inputs;
+
+    Model model;
+
+    void OnEnable()
+    {
+        model = ModelLoader.Load(modelAsset);
+        m_Worker = new Worker(model, BackendType.GPUCompute);
+
+        // The MultipleInputMultipleOuput model takes two inputs, "input0" and "input1"
+        // since it has multiple inputs, we need to use a dictionary tensorName -> tensor
+        //m_Inputs = new Tensor[]
+        //{
+        //    new Tensor<float>(new TensorShape(1024)),
+        //    new Tensor<float>(new TensorShape(1))
+        //};
+    }
+    public Texture2D faceImg;
+    public Texture2D faceImg2;
+    float[] result1;
+    float[] result2;
+    void Update()
+    {
+       
+       // m_Worker.Schedule(m_Inputs);
+
+        // model has multiple output, so to know which output to get we need to specify which one we are referring to
+       // var outputTensor0 = m_Worker.PeekOutput("output0") as Tensor<float>;
+        //var outputTensor1 = m_Worker.PeekOutput("output1") as Tensor<float>;
+
+        // If you wish to read from the tensor, download it to cpu.
+        // See async examples for non-blocking readback.
+        //using var cpuTensor0 = outputTensor0.ReadbackAndClone();
+        //using var cpuTensor1 = outputTensor1.ReadbackAndClone();
+
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            result1 = ExtractFeature(faceImg);
+        }
+
+        if (Input.GetKeyDown(KeyCode.D))
+        {
+            result2 = ExtractFeature(faceImg2);
+        }
+
+        if (Input.GetKeyDown(KeyCode.F))
+        {
+            Debug.Log(CalculateSimilarity(result1, result2));
+        }
+    }
+
+    void OnDisable()
+    {
+        // Clean up Sentis resources.
+        m_Worker.Dispose();
+        foreach (var tensor in m_Inputs) { tensor.Dispose(); }
+    }
+
+    
+
+    private int modelInputSize = 112;
+    public float[] ExtractFeature(Texture2D faceImg)
+    {
+        if (faceImg == null) return null;
+
+        // --- 步骤 1: 预处理 (参考 Python: (img - 127.5) / 128.0) ---
+        // 注意：Unity Texture2D 的 GetPixels() 返回的是 RGBA，且范围是 0.0-1.0
+        Color[] pixels = faceImg.GetPixels();
+
+        // 确保图片大小符合模型要求 (112x112)，如果原图不是，需要 Resize
+        // 这里假设 faceImg 已经是 112x112，如果不是，请在此处添加 Resize 逻辑
+        if (faceImg.width != modelInputSize || faceImg.height != modelInputSize)
+        {
+            Debug.LogWarning($"Image size {faceImg.width}x{faceImg.height} does not match model input {modelInputSize}x{modelInputSize}. Resizing...");
+            // 这里需要手动 Resize Texture2D，Sentis 不自动 Resize
+            // 简化处理：如果尺寸不对，这里应该返回 null 或者进行 Resize 操作
+            // 为了代码完整性，假设你已经有 Resize 方法，或者强制要求输入图片尺寸正确
+        }
+
+        int h = modelInputSize;
+        int w = modelInputSize;
+        int totalPixels = h * w;
+
+        // 创建输入数据数组 (Batch * H * W * 3)
+        float[] inputData = new float[totalPixels * 3];
+        for (int i = 0; i < totalPixels; i++)
+        {
+            // Python: img.astype(np.float32) - 127.5) / 128.0
+            // Unity: pixels[i] 范围是 0.0 ~ 1.0
+            float r = pixels[i].r * 255.0f;
+            float g = pixels[i].g * 255.0f;
+            float b = pixels[i].b * 255.0f;
+
+            // 对应 Python 的归一化公式
+            inputData[i * 3 + 0] = (r - 127.5f) / 128.0f;
+            inputData[i * 3 + 1] = (g - 127.5f) / 128.0f;
+            inputData[i * 3 + 2] = (b - 127.5f) / 128.0f;
+        }
+
+        // --- 步骤 2: 创建输入 Tensor ---
+        // 形状: [1, 112, 112, 3]
+        TensorShape inputShape = new TensorShape(1, modelInputSize, modelInputSize, 3);
+        var inputTensor = new Tensor<float>(inputShape, inputData);
+
+        // --- 步骤 3: 执行推理 ---
+        m_Worker.Schedule(inputTensor);
+
+        // 获取输出张量
+        var outputTensor = m_Worker.PeekOutput() as Tensor<float>;
+        if (outputTensor == null)
+        {
+            inputTensor.Dispose();
+            Debug.LogError("Failed to get output tensor.");
+            return null;
+        }
+
+        // --- 步骤 4: 获取输出数据 (核心修复部分) ---
+        // 1. 打印 Shape 以便调试 (参考 Python 的 output_name 形状)
+        Debug.Log($"Model Output Shape: {outputTensor.shape}, Rank: {outputTensor.shape.rank}");
+
+        // 2. 获取特征维度大小
+        // 假设输出是 [1, 512]，Rank 是 2。我们需要最后一个维度的大小 (512)。
+        // 安全获取：
+        int lastDimIndex = outputTensor.shape.rank - 1;
+        if (lastDimIndex < 0)
+        {
+            inputTensor.Dispose();
+            Debug.LogError("Output tensor has no dimensions.");
+            return null;
+        }
+
+        int embeddingSize = outputTensor.shape[lastDimIndex];
+
+        // 3. 读取数据到 CPU
+        // ReadbackAndClone 返回一个 CPU 可访问的 Tensor
+        // DownloadToArray() 直接返回扁平化的一维 float 数组
+        // 对于 [1, 512]，它会返回长度为 512 的数组
+        float[] embedding;
+        using (var cpuOutput = outputTensor.ReadbackAndClone())
+        {
+            embedding = cpuOutput.DownloadToArray();
+        }
+
+        // 验证读取的长度是否正确
+        if (embedding.Length != embeddingSize)
+        {
+            Debug.LogWarning($"Expected size {embeddingSize}, but got {embedding.Length}. Using actual length.");
+            embeddingSize = embedding.Length;
+        }
+
+        // 释放输入张量 (输出张量由 Worker 管理，ReadbackAndClone 返回的 cpuOutput 已释放)
+        inputTensor.Dispose();
+
+        // --- 步骤 5: 向量归一化 (参考 Python: np.linalg.norm) ---
+        float norm = 0f;
+        for (int i = 0; i < embeddingSize; i++)
+        {
+            norm += embedding[i] * embedding[i];
+        }
+        norm = Mathf.Sqrt(norm);
+
+        if (norm > 0.000001f)
+        {
+            for (int i = 0; i < embeddingSize; i++)
+            {
+                embedding[i] /= norm;
+            }
+        }
+
+        // 调试输出前几个值，确认数据正常
+        Debug.Log($"Extracted Feature (first 5): {embedding[0]}, {embedding[1]}, {embedding[2]}, {embedding[3]}, {embedding[4]}");
+
+        return embedding;
+    }
+
+    // 测试用：计算余弦相似度
+    public float CalculateSimilarity(float[] emb1, float[] emb2)
+    {
+        if (emb1 == null || emb2 == null || emb1.Length != emb2.Length) return 0f;
+
+        float dot = 0f;
+        for (int i = 0; i < emb1.Length; i++)
+        {
+            dot += emb1[i] * emb2[i];
+        }
+        // 因为向量已经归一化，点积即为余弦相似度
+        return dot;
+    }
+}
